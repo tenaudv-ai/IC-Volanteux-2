@@ -1,0 +1,1 @@
+import{j as e}from"./index-DMvidpQd.js";import{b as t,c as d,d as n,e as c}from"./card-Bf1ZzIhH.js";function i({title:s,description:r,action:a}){return e.jsxs(t,{className:"border-dashed",children:[e.jsx(d,{children:e.jsx(n,{children:s})}),e.jsxs(c,{className:"space-y-4",children:[e.jsx("p",{className:"text-sm text-muted-foreground",children:r}),a]})]})}export{i as E};
