@@ -21,6 +21,9 @@ export interface Category {
   name: string;
   /** "shared" = répartie entre joueurs présents à la rencontre, "club" = payée par le club */
   splitMode: "shared" | "club";
+  /** Tarif au km remboursé (€/km) pour les rencontres à l'extérieur. Si défini, le montant
+   *  est calculé : distance aller × 2 × tarif. */
+  kmRate?: number;
 }
 
 /** Versement ponctuel d'un joueur en cours d'année */
@@ -85,6 +88,8 @@ export interface Match {
   results?: MatchResult[];
   /** Rencontre jouée à domicile (consomme des volants) */
   isHome?: boolean;
+  /** Distance aller (km) depuis Andenne jusqu'à la salle adverse (rencontres à l'extérieur) */
+  distanceKm?: number;
 }
 
 export interface Team {
