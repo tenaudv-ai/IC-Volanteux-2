@@ -146,6 +146,24 @@ function Page() {
                       <SelectItem value="club">Club</SelectItem>
                     </SelectContent>
                   </Select>
+                  <label
+                    className="flex items-center gap-1 text-xs text-muted-foreground"
+                    title="Tarif remboursé par km pour les rencontres à l'extérieur (distance aller × 2 × tarif)"
+                  >
+                    <Input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      placeholder="—"
+                      defaultValue={c.kmRate ?? ""}
+                      className="h-9 w-20 text-right"
+                      onBlur={(e) => {
+                        const v = parseFloat(e.target.value);
+                        store.updateCategory(season.id, c.id, { kmRate: v > 0 ? v : undefined });
+                      }}
+                    />
+                    €/km ext.
+                  </label>
                   <Button
                     size="icon"
                     variant="ghost"

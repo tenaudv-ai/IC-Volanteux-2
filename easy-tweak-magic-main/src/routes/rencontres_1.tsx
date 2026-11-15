@@ -1,0 +1,628 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { AppShell } from "@/components/AppShell";
+import { findClubDistance, travelAmount } from "@/lib/distances";
+import { useStore, useCurrent } from "@/lib/store";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Plus, Trash2, ChevronDown, ChevronRight, FileDown } from "lucide-react";
+import { useState } from "react";
+import { EmptyState } from "@/components/EmptyState";
+import { computeTeam, fmt } from "@/lib/compute";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import { findRosterMatch, parseMatchText, type ParsedMatch } from "@/lib/import-text";
+import { toast } from "sonner";
+
+export const Route = createFileRoute("/rencontres")({
+  head: () => ({ meta: [{ title: "Rencontres — Gestion Interclubs Volanteux" }] }),
+  component: Page,
+});
+
+function Page() {
+  const { season, team } = useCurrent();
+  const {
+    addMatch,
+    removeMatch,
+    updateMatch,
+    setMatchExpense,
+    toggleMatchPlayer,
+    addRosterPlayer,
+    addPlayerFromRoster,
+    roster,
+  } = useStore();
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [parsed, setParsed] = useState<ParsedMatch | null>(null);
+  /** true = nous sommes domicile dans le texte, false = nous sommes extérieur (inverse home↔away) */
+  const [weAreHome, setWeAreHome] = useState(true);
+  /** rawName -> rosterId | "__new__" | "" (skip) */
+  const [matchMap, setMatchMap] = useState<Record<string, string>>({});
+
+  if (!season)
+    return (
+      <AppShell>
+        <EmptyState title="Pas de saison" description="Créez une saison pour commencer." />
+      </AppShell>
+    );
+  if (!team)
+    return (
+      <AppShell>
+        <EmptyState title="Aucune équipe" description="Choisissez ou créez une équipe." />
+      </AppShell>
+    );
+
+  const totals = computeTeam(season, team);
+
+  function deriveHomeWon(sets: { home: number; away: number }[]) {
+    const hasSets = sets.some((x) => x.home > 0 || x.away > 0);
+    if (!hasSets) return undefined;
+
+    let homeSetsWon = 0;
+    let awaySetsWon = 0;
+    for (const set of sets) {
+      if (set.home > set.away) homeSetsWon += 1;
+      else if (set.away > set.home) awaySetsWon += 1;
+    }
+
+    if (homeSetsWon === awaySetsWon) return undefined;
+    return homeSetsWon > awaySetsWon;
+  }
+
+  function detectOurSide(p: ParsedMatch): boolean {
+    if (p.weAreHome !== undefined) return p.weAreHome;
+    // Fallback : compter combien de joueurs de chaque côté matchent le roster
+    const homeHits = p.homePlayers.filter((hp) => findRosterMatch(hp.key, roster)).length;
+    const awayHits = p.awayPlayers.filter((hp) => findRosterMatch(hp.key, roster)).length;
+    if (homeHits === 0 && awayHits === 0) return true;
+    return homeHits >= awayHits;
+  }
+
+  function previewParse(text: string) {
+    const p = parseMatchText(text);
+    setParsed(p);
+    const ourSideIsHome = detectOurSide(p);
+    setWeAreHome(ourSideIsHome);
+    const ourPlayers = ourSideIsHome ? p.homePlayers : p.awayPlayers;
+    // Pre-fill matches from roster
+    const map: Record<string, string> = {};
+    for (const hp of ourPlayers) {
+      const r = findRosterMatch(hp.key, roster);
+      map[hp.rawName] = r ? r.id : "__new__";
+    }
+    setMatchMap(map);
+  }
+
+  function recomputeMap(p: ParsedMatch, ourIsHome: boolean) {
+    const ourPlayers = ourIsHome ? p.homePlayers : p.awayPlayers;
+    const map: Record<string, string> = {};
+    for (const hp of ourPlayers) {
+      const r = findRosterMatch(hp.key, roster);
+      map[hp.rawName] = r ? r.id : "__new__";
+    }
+    setMatchMap(map);
+  }
+
+  function applyImport() {
+    if (!parsed || !season || !team) return;
+    const ourPlayers = weAreHome ? parsed.homePlayers : parsed.awayPlayers;
+    const nameToRoster: Record<string, string> = {};
+    for (const hp of ourPlayers) {
+      const choice = matchMap[hp.rawName];
+      if (!choice) continue;
+      let rosterId = choice;
+      if (choice === "__new__") {
+        const parts = hp.rawName.split(/\s+/);
+        const first = parts[0] ?? hp.rawName;
+        const last = parts.slice(1).join(" ") || hp.rawName;
+        rosterId = addRosterPlayer({
+          gender: "H",
+          firstName: first,
+          lastName: last,
+          affiliation: "",
+        });
+      }
+      const existing = team.players.find((p) => p.rosterId === rosterId);
+      if (!existing) addPlayerFromRoster(season.id, team.id, rosterId);
+      nameToRoster[hp.rawName] = rosterId;
+    }
+    const resolvedRosterIds = [...new Set(Object.values(nameToRoster))];
+    const fresh = useStore
+      .getState()
+      .seasons.find((s) => s.id === season.id)
+      ?.teams.find((t) => t.id === team.id);
+    const playerIdsForMatch: string[] = [];
+    if (fresh) {
+      for (const rid of resolvedRosterIds) {
+        const tp = fresh.players.find((p) => p.rosterId === rid);
+        if (tp) playerIdsForMatch.push(tp.id);
+      }
+    }
+
+    // Build detailed results[] — "home" côté résultat = NOTRE côté (peu importe domicile/extérieur réel)
+    const results = parsed.results.map((r) => {
+      const ourSide = weAreHome ? r.home : r.away;
+      const oppSide = weAreHome ? r.away : r.home;
+      // Si nous sommes extérieur, les sets sont enregistrés en "home-away" du PV → inverser pour notre POV
+      const sets = weAreHome
+        ? r.sets
+        : r.sets.map((s) => ({ home: s.away, away: s.home }));
+      const homeWon =
+        r.homeWon === undefined ? undefined : weAreHome ? r.homeWon : !r.homeWon;
+      return {
+        code: r.code,
+        kind: r.kind,
+        homeRosterIds: ourSide
+          .map((p) => nameToRoster[p.rawName])
+          .filter((x): x is string => Boolean(x)),
+        awayNames: oppSide.map((p) => p.rawName),
+        sets,
+        homeWon,
+        forfeit: r.forfeit,
+      };
+    });
+
+    const matchId = addMatch(season.id, team.id, parsed.label || "Rencontre importée");
+    for (const pid of playerIdsForMatch) {
+      toggleMatchPlayer(season.id, team.id, matchId, pid);
+    }
+    updateMatch(season.id, team.id, matchId, { results, isHome: weAreHome });
+    setOpenId(matchId);
+    setImportOpen(false);
+    setImportText("");
+    setParsed(null);
+    setMatchMap({});
+    toast.success(
+      `Rencontre importée (${weAreHome ? "domicile" : "extérieur"}) : ${playerIdsForMatch.length} joueur·s, ${results.length} match·s`,
+    );
+  }
+
+  return (
+    <AppShell>
+      <div className="mb-4 flex items-center justify-between">
+        <div>
+          <h1 className="font-display text-2xl font-bold">Rencontres — {team.name}</h1>
+          <p className="text-sm text-muted-foreground">{season.name}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Dialog open={importOpen} onOpenChange={setImportOpen}>
+            <DialogTrigger asChild>
+              <Button variant="secondary">
+                <FileDown className="h-4 w-4" /> Importer (texte)
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="max-w-3xl">
+              <DialogHeader>
+                <DialogTitle>Importer une rencontre</DialogTitle>
+                <DialogDescription>
+                  Collez le texte de la rencontre (Tabt). L'app détecte les joueurs de votre
+                  équipe et crée la rencontre.
+                </DialogDescription>
+              </DialogHeader>
+              <Textarea
+                rows={10}
+                value={importText}
+                onChange={(e) => {
+                  setImportText(e.target.value);
+                  if (e.target.value.trim()) previewParse(e.target.value);
+                  else setParsed(null);
+                }}
+                placeholder={`LES VOLANTEUX 1 (M) [339] (180-M-1) - BC METTET 2 ...\nDH1\nMartin GILSON (10)Daryl CARVAJAL (12)\n-\nEric Marchal (12)David Lecrinier (12)\n21-13 21-12\n...`}
+              />
+              {parsed && (() => {
+                const ourPlayers = weAreHome ? parsed.homePlayers : parsed.awayPlayers;
+                return (
+                  <div className="space-y-3">
+                    {parsed.label && (
+                      <p className="text-sm">
+                        <span className="font-semibold">Rencontre :</span> {parsed.label}
+                      </p>
+                    )}
+                    <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 p-2">
+                      <span className="text-sm font-medium">Notre équipe joue :</span>
+                      <div className="flex gap-1">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={weAreHome ? "default" : "outline"}
+                          onClick={() => {
+                            setWeAreHome(true);
+                            recomputeMap(parsed, true);
+                          }}
+                        >
+                          À domicile
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={!weAreHome ? "default" : "outline"}
+                          onClick={() => {
+                            setWeAreHome(false);
+                            recomputeMap(parsed, false);
+                          }}
+                        >
+                          À l'extérieur
+                        </Button>
+                      </div>
+                      {parsed.weAreHome !== undefined && (
+                        <span className="text-xs text-muted-foreground">
+                          (auto-détecté : {parsed.weAreHome ? "domicile" : "extérieur"})
+                        </span>
+                      )}
+                    </div>
+                    <div>
+                      <Label className="mb-2 block">
+                        Joueurs Volanteux détectés ({ourPlayers.length})
+                      </Label>
+                      <div className="space-y-1.5">
+                        {ourPlayers.map((hp) => (
+                          <div key={hp.rawName} className="flex items-center gap-2">
+                            <span className="flex-1 text-sm">{hp.rawName}</span>
+                            <select
+                              className="h-9 rounded-md border bg-background px-2 text-sm"
+                              value={matchMap[hp.rawName] ?? ""}
+                              onChange={(e) =>
+                                setMatchMap({ ...matchMap, [hp.rawName]: e.target.value })
+                              }
+                            >
+                              <option value="">— ignorer —</option>
+                              <option value="__new__">+ Créer dans le roster</option>
+                              {roster.map((r) => (
+                                <option key={r.id} value={r.id}>
+                                  {r.lastName} {r.firstName}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+              <DialogFooter>
+                <Button onClick={applyImport} disabled={!parsed}>
+                  Créer la rencontre
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          <Button
+            onClick={() => {
+              const id = addMatch(season.id, team.id);
+              setOpenId(id);
+            }}
+          >
+            <Plus className="h-4 w-4" /> Ajouter
+          </Button>
+        </div>
+      </div>
+
+      {team.matches.length === 0 && (
+        <EmptyState
+          title="Aucune rencontre"
+          description='Cliquez sur "Ajouter" pour créer la première.'
+        />
+      )}
+
+      <div className="space-y-3">
+        {team.matches.map((m) => {
+          const isOpen = openId === m.id;
+          const total = m.expenses.reduce((s, e) => s + e.amount, 0);
+          return (
+            <Card key={m.id}>
+              <CardHeader
+                className="cursor-pointer"
+                onClick={() => setOpenId(isOpen ? null : m.id)}
+              >
+                <div className="flex items-center gap-2">
+                  {isOpen ? (
+                    <ChevronDown className="h-4 w-4" />
+                  ) : (
+                    <ChevronRight className="h-4 w-4" />
+                  )}
+                  <Input
+                    className="max-w-xs"
+                    defaultValue={m.label}
+                    onClick={(e) => e.stopPropagation()}
+                    onBlur={(e) =>
+                      updateMatch(season.id, team.id, m.id, { label: e.target.value })
+                    }
+                  />
+                  <span className="ml-auto text-sm text-muted-foreground">
+                    {m.playerIds.length} joueur·s · {fmt(total)}
+                  </span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removeMatch(season.id, team.id, m.id);
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              </CardHeader>
+              {isOpen && (
+                <CardContent className="space-y-4">
+                  <label className="flex w-fit cursor-pointer items-center gap-2 rounded-md border px-3 py-1.5 text-sm">
+                    <Checkbox
+                      checked={!!m.isHome}
+                      onCheckedChange={(v) =>
+                        updateMatch(season.id, team.id, m.id, { isHome: !!v })
+                      }
+                    />
+                    À domicile (consomme des volants)
+                  </label>
+                  <div>
+                    <Label className="mb-2 block">Frais</Label>
+                    <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                      {season.categories.map((c) => {
+                        const e = m.expenses.find((x) => x.categoryId === c.id);
+                        if (c.kmRate && !m.isHome) {
+                          const rate = c.kmRate;
+                          const suggestion = findClubDistance(m.label);
+                          const applyKm = (km: number) => {
+                            updateMatch(season.id, team.id, m.id, { distanceKm: km || undefined });
+                            setMatchExpense(season.id, team.id, m.id, {
+                              categoryId: c.id,
+                              amount: km > 0 ? travelAmount(km, rate) : 0,
+                            });
+                          };
+                          return (
+                            <div
+                              key={c.id}
+                              className="flex flex-wrap items-center gap-2 rounded-md border border-primary/40 p-2"
+                            >
+                              <span className="flex-1 text-sm">
+                                {c.name}
+                                <span className="ml-1 text-xs text-muted-foreground">
+                                  (extérieur · {rate.toFixed(2)} €/km)
+                                </span>
+                              </span>
+                              <Input
+                                key={`km-${m.distanceKm ?? ""}`}
+                                type="number"
+                                step="1"
+                                min="0"
+                                placeholder="km"
+                                defaultValue={m.distanceKm ?? ""}
+                                className="w-20 text-right"
+                                aria-label="Distance aller en km"
+                                onBlur={(ev) => applyKm(parseFloat(ev.target.value) || 0)}
+                              />
+                              <span className="text-xs text-muted-foreground">km aller</span>
+                              <span className="w-full text-right text-sm font-semibold sm:w-auto">
+                                = {(e?.amount ?? 0).toFixed(2)} €
+                              </span>
+                              {m.distanceKm === undefined && suggestion && (
+                                <button
+                                  type="button"
+                                  className="w-full rounded-md bg-primary/15 px-2 py-1 text-left text-xs text-primary hover:bg-primary/25"
+                                  onClick={() => applyKm(suggestion.km)}
+                                >
+                                  Utiliser {suggestion.km} km ({suggestion.hall}) depuis Andenne
+                                </button>
+                              )}
+                              {m.distanceKm !== undefined && (
+                                <span className="w-full text-xs text-muted-foreground">
+                                  {m.distanceKm} km × 2 (A/R) × {rate.toFixed(2)} €
+                                </span>
+                              )}
+                            </div>
+                          );
+                        }
+                        return (
+                          <div
+                            key={c.id}
+                            className="flex items-center gap-2 rounded-md border p-2"
+                          >
+                            <span className="flex-1 text-sm">
+                              {c.name}
+                              <span className="ml-1 text-xs text-muted-foreground">
+                                ({c.splitMode === "club" ? "club" : "partagé"})
+                              </span>
+                            </span>
+                            <Input
+                              type="number"
+                              step="0.01"
+                              defaultValue={e?.amount ?? ""}
+                              className="w-28 text-right"
+                              onBlur={(ev) =>
+                                setMatchExpense(season.id, team.id, m.id, {
+                                  categoryId: c.id,
+                                  amount: parseFloat(ev.target.value) || 0,
+                                })
+                              }
+                            />
+                            <span className="text-xs text-muted-foreground">€</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <Label className="mb-2 block">Joueurs présents</Label>
+                    <div className="flex flex-wrap gap-2">
+                      {team.players.map((p) => {
+                        const checked = m.playerIds.includes(p.id);
+                        return (
+                          <label
+                            key={p.id}
+                            className={`flex cursor-pointer items-center gap-2 rounded-full border px-3 py-1.5 text-sm transition-colors ${checked ? "border-primary bg-primary/10" : "hover:bg-muted"}`}
+                          >
+                            <Checkbox
+                              checked={checked}
+                              onCheckedChange={() =>
+                                toggleMatchPlayer(season.id, team.id, m.id, p.id)
+                              }
+                            />
+                            {p.name}
+                          </label>
+                        );
+                      })}
+                    </div>
+                    {team.players.length === 0 && (
+                      <p className="text-sm text-muted-foreground">
+                        Ajoutez d'abord des joueurs dans l'onglet Joueurs.
+                      </p>
+                    )}
+                  </div>
+
+                  {m.results && m.results.length > 0 && (
+                    <div>
+                      <Label className="mb-2 block">Résultats détaillés (éditables)</Label>
+                      <div className="space-y-1.5">
+                        {m.results.map((r, idx) => {
+                          const homeNames = r.homeRosterIds
+                            .map((rid) => roster.find((x) => x.id === rid)?.lastName ?? "?")
+                            .join(" / ");
+                          const awayNames = r.awayNames.join(" / ");
+                          return (
+                            <div
+                              key={idx}
+                              className={`flex flex-wrap items-center gap-2 rounded-md border p-2 text-sm ${r.homeWon ? "border-success/50 bg-success/5" : r.homeWon === false ? "border-destructive/40 bg-destructive/5" : ""}`}
+                            >
+                              <span className="font-mono font-bold text-primary">{r.code}</span>
+                              <span className="font-medium">{homeNames}</span>
+                              <span className="text-muted-foreground">vs</span>
+                              <span>{awayNames}</span>
+                              <div className="flex items-center gap-1">
+                                {r.sets.map((s, si) => (
+                                  <span key={si} className="flex items-center gap-0.5">
+                                    <Input
+                                      type="number"
+                                      defaultValue={s.home}
+                                      className="h-7 w-14 px-1 text-center [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                      onBlur={(e) => {
+                                        const v = parseInt(e.target.value, 10) || 0;
+                                        const sets = r.sets.map((x, i) =>
+                                          i === si ? { ...x, home: v } : x,
+                                        );
+                                        useStore
+                                          .getState()
+                                          .updateMatchResult(season.id, team.id, m.id, idx, {
+                                            sets,
+                                            homeWon: deriveHomeWon(sets),
+                                          });
+                                      }}
+                                    />
+                                    <span>-</span>
+                                    <Input
+                                      type="number"
+                                      defaultValue={s.away}
+                                      className="h-7 w-14 px-1 text-center [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                                      onBlur={(e) => {
+                                        const v = parseInt(e.target.value, 10) || 0;
+                                        const sets = r.sets.map((x, i) =>
+                                          i === si ? { ...x, away: v } : x,
+                                        );
+                                        useStore
+                                          .getState()
+                                          .updateMatchResult(season.id, team.id, m.id, idx, {
+                                            sets,
+                                            homeWon: deriveHomeWon(sets),
+                                          });
+                                      }}
+                                    />
+                                  </span>
+                                ))}
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7"
+                                  onClick={() =>
+                                    useStore
+                                      .getState()
+                                      .updateMatchResult(season.id, team.id, m.id, idx, {
+                                        sets: [...r.sets, { home: 0, away: 0 }],
+                                        homeWon: deriveHomeWon([...r.sets, { home: 0, away: 0 }]),
+                                      })
+                                  }
+                                >
+                                  +set
+                                </Button>
+                              </div>
+                              <select
+                                className="h-7 rounded-md border bg-background px-1 text-xs"
+                                value={r.homeWon === undefined ? "" : r.homeWon ? "won" : "lost"}
+                                onChange={(e) => {
+                                  const v = e.target.value;
+                                  useStore
+                                    .getState()
+                                    .updateMatchResult(season.id, team.id, m.id, idx, {
+                                      homeWon: v === "" ? undefined : v === "won",
+                                    });
+                                }}
+                              >
+                                <option value="">?</option>
+                                <option value="won">Gagné</option>
+                                <option value="lost">Perdu</option>
+                              </select>
+                              <label className="flex items-center gap-1 text-xs">
+                                <Checkbox
+                                  checked={!!r.forfeit}
+                                  onCheckedChange={(v) =>
+                                    useStore
+                                      .getState()
+                                      .updateMatchResult(season.id, team.id, m.id, idx, {
+                                        forfeit: !!v,
+                                      })
+                                  }
+                                />
+                                WO
+                              </label>
+                              <Button
+                                size="icon"
+                                variant="ghost"
+                                className="h-7 w-7"
+                                onClick={() => {
+                                  const results = (m.results ?? []).filter((_, i) => i !== idx);
+                                  updateMatch(season.id, team.id, m.id, { results });
+                                }}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+
+      {totals.players.length > 0 && (
+        <Card className="mt-6">
+          <CardHeader>
+            <CardTitle>Récap équipe</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-muted-foreground">
+            Total dépenses :{" "}
+            <span className="font-semibold text-foreground">{fmt(totals.totalExpenses)}</span> ·
+            Pris en charge club :{" "}
+            <span className="font-semibold text-foreground">{fmt(totals.clubSubsidyTotal)}</span>{" "}
+            (budget saison : {fmt(season.clubBudget)})
+          </CardContent>
+        </Card>
+      )}
+    </AppShell>
+  );
+}
